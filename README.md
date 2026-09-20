@@ -17,6 +17,6 @@ Needs network access for the Three.js CDN scripts.
 
 ## Live
 
-https://ascii-bot.vercel.app
+https://decapostos.github.io/ascii-bot/
 
-This repo is the source of truth. The Vercel project deploys from it.
+This repo is the source of truth, served via GitHub Pages.
