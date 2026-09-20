@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASCII Head — Three.js</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #error {
+    position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 10;
+    display: none; padding: 10px 14px; border-radius: 6px;
+    background: rgba(140, 0, 0, 0.9); color: #fff;
+    font: 13px/1.5 monospace; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<div id="error"></div>
+
+<!--
+  ============================================================================
+  ASCII HEAD — single-file Three.js scene with a GPU ASCII post-process pass.
+  ----------------------------------------------------------------------------
+  How it works
+    • The head is a displaced sphere (value-noise wobble + breathing) with two
+      eye sockets carved out in the VERTEX SHADER. The socket centers are driven
+      by the mouse uniform, so the eyes track the cursor.
+    • The scene renders to a render target, then a full-screen GLSL pass samples
+      per-character-cell luminance and picks a glyph from a runtime-generated
+      font atlas (canvas → CanvasTexture). No external assets, no old
+      three/addons AsciiEffect — it's a modern custom shader pass.
+    • Density is INVERTED luminance → character: shadowed areas (top of the
+      head, silhouette edges, the carved sockets) render the dense glyphs
+      (@ Q a % # *), lit areas (lower face / underside) render sparse dots and
+      '+'. Lighting is "underlit horror skull": strong light from below-front
+      so the top is dense and density fades toward the bottom.
+
+  Loading
+    three.js is loaded as a plain classic <script> (no ES modules, no import
+    maps) so this works when opened directly from disk (file://). If the first
+    CDN is unreachable a second one is tried automatically, and any startup
+    error is printed on screen instead of leaving a silent black page.
+
+  Recording with Remotion (optional)
+    All animation is driven by a single clock `t` (uTime + JS rotations), so
+    you can drive it deterministically. In a Remotion <ThreeCanvas> you would:
+      const t = useCurrentFrame() / 30;            // seconds
+      window.setSceneTime && window.setSceneTime(t);
+    The override below (`window.setSceneTime`) forces the clock to a fixed
+    value so every frame is reproducible. Render at 30 fps.
+  ============================================================================
+-->
+
+<!-- three.js as a classic script with a CDN fallback (works from file://) -->
+<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+<script>
+  if (!window.THREE) {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"><\/script>');
+  }
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---- visible error reporting instead of a silent black page ---- */
+  var errorEl = document.getElementById('error');
+  function showError(msg) {
+    errorEl.style.display = 'block';
+    errorEl.textContent = String(msg);
+    if (window.console) console.error(msg);
+  }
+  window.addEventListener('error', function (e) {
+    showError('Runtime error: ' + (e.message || e.error || 'unknown'));
+  });
+
+  try {
+
+    if (!window.THREE) {
+      throw new Error(
+        'three.js could not be loaded from either CDN.\n' +
+        'You need an internet connection the first time (the file is then cached by the browser).'
+      );
+    }
+    var THREE = window.THREE;
+
+    /* ------------------------------------------------------------------
+     * 1. Character atlas (built at runtime on a <canvas>, no assets)
+     *    Sparse -> dense. Index 0 (space) is reserved for the background.
+     *    Dense end (a Q @) is what fills the eye sockets and the shadowed top.
+     * ------------------------------------------------------------------ */
+    var CHAR_SET = ' .:+*#%aQ@';
+    var ATLAS_CELL_W = 48;
+    var ATLAS_CELL_H = 96;
+
+    function buildAtlas() {
+      var canvas = document.createElement('canvas');
+      canvas.width = CHAR_SET.length * ATLAS_CELL_W;
+      canvas.height = ATLAS_CELL_H;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold ' + Math.round(ATLAS_CELL_H * 0.78) + "px 'Courier New', Courier, monospace";
+      for (var i = 0; i < CHAR_SET.length; i++) {
+        ctx.fillText(CHAR_SET[i], i * ATLAS_CELL_W + ATLAS_CELL_W / 2, ATLAS_CELL_H / 2 + 3);
+      }
+      var tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.NoColorSpace;      // keep raw glyph masks (white = 1)
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    }
+
+    /* ------------------------------------------------------------------
+     * 2. Renderer / scene / camera
+     * ------------------------------------------------------------------ */
+    var DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    var renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+    } catch (e) {
+      throw new Error('WebGL is not available in this browser: ' + e.message);
+    }
+    renderer.setPixelRatio(DPR);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 1);
+    document.body.appendChild(renderer.domElement);
+
+    var scene = new THREE.Scene();
+    var camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 3.4);
+
+    /* ------------------------------------------------------------------
+     * 3. The head — displaced sphere, sockets carved in the vertex shader.
+     *    Noise keeps it organic; a mouse uniform slides the socket centers.
+     * ------------------------------------------------------------------ */
+    var headVert = [
+      'uniform float uTime;',
+      'uniform vec2  uMouse;',
+      '',
+      'varying vec3  vNormalW;',
+      'varying vec3  vWorldPos;',
+      'varying float vSocket;',
+      'varying float vSocketRim;',
+      '',
+      'float hash(vec3 p) {', 
+      '  p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));',
+      '  p *= 17.0;',
+      '  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));',
+      '}',
+      '',
+      'float noise3(vec3 x) {',
+      '  vec3 i = floor(x);',
+      '  vec3 f = fract(x);',
+      '  f = f * f * (3.0 - 2.0 * f);',
+      '  return mix(',
+      '    mix(mix(hash(i),                hash(i + vec3(1.0, 0.0, 0.0)), f.x),',
+      '        mix(hash(i + vec3(0.0, 1.0, 0.0)), hash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),',
+      '    mix(mix(hash(i + vec3(0.0, 0.0, 1.0)), hash(i + vec3(1.0, 0.0, 1.0)), f.x),',
+      '        mix(hash(i + vec3(0.0, 1.0, 1.0)), hash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),',
+      '    f.z);',
+      '}',
+      '',
+      'void main() {',
+      '  vec3 pos = position;',
+      '  vec3 n = normalize(normal);',
+      '  float t = uTime;',
+      '',
+      '  // breathe',
+      '  pos *= 1.0 + sin(t * 0.7) * 0.018;',
+      '',
+      '  // organic wobble — two octaves of value noise drifting over time',
+      '  float w = noise3(pos * 1.6 + vec3(0.0, t * 0.22, 0.0)) * 0.07',
+      '          + noise3(pos * 4.2 - vec3(t * 0.16, 0.0, 0.0)) * 0.03;', 
+      '  pos += n * w;',
+      '',
+      '  // eye sockets — centers slide with the mouse (head faces +Z)',
+      '  vec2 m = uMouse;',
+      '  vec3 eyeA = vec3(-0.27 + m.x * 0.035,  0.10 - m.y * 0.035, 0.92);',
+      '  vec3 eyeB = vec3( 0.27 + m.x * 0.035,  0.10 - m.y * 0.035, 0.92);', 
+      '',
+      '  float dA = length((pos - eyeA) * vec3(1.0, 0.8, 0.7));',
+      '  float dB = length((pos - eyeB) * vec3(1.0, 0.8, 0.7));',
+      '  float carveA = 1.0 - smoothstep(0.05, 0.24, dA);',
+      '  float carveB = 1.0 - smoothstep(0.05, 0.24, dB);', 
+      '  float socket = max(carveA, carveB);',
+      '  pos -= n * socket * 0.36;               // push inward along the normal',
+      '',
+      '  // bright ring just outside each cavity (eyelid highlight)',
+      '  float rimA = smoothstep(0.20, 0.25, dA) * (1.0 - smoothstep(0.30, 0.36, dA));',
+      '  float rimB = smoothstep(0.20, 0.25, dB) * (1.0 - smoothstep(0.30, 0.36, dB));',
+      '  vSocketRim = max(rimA, rimB);',
+      '',
+      '  // tilt normals into the cavity so its walls shade naturally (depth cue)',
+      '  vec3 eyeC = carveA > carveB ? eyeA : eyeB;',
+      '  n = normalize(mix(n, normalize(pos - eyeC), socket * 0.55));',
+      '',
+      '  vSocket = socket;', 
+      '  vNormalW = normalize(mat3(modelMatrix) * n);',
+      '  vec4 wp = modelMatrix * vec4(pos, 1.0);',
+      '  vWorldPos = wp.xyz;',
+      '  gl_Position = projectionMatrix * viewMatrix * wp;',
+      '}'
+    ].join('\n');
+
+    var headFrag = [
+      'uniform vec3  uMainLightPos;',
+      'uniform float uMainLightIntensity;',
+      'uniform vec3  uFrontLightPos;',
+      'uniform float uFrontLightIntensity;',
+      'uniform float uAmbient;',
+      'uniform float uHeadRim;     // fresnel rim strength — lifts the silhouette off the background',
+      'uniform float uSocketRim;   // bright ring around the eye sockets',
+      '',
+      'varying vec3  vNormalW;',
+      'varying vec3  vWorldPos;',
+      'varying float vSocket;',
+      'varying float vSocketRim;', 
+      '',
+      'void main() {',
+      '  vec3 N = normalize(vNormalW);',
+      '  vec3 V = normalize(cameraPosition - vWorldPos);',
+      '',
+      '  // strong light from below-front (horror skull underlighting)', 
+      '  vec3 L1 = normalize(uMainLightPos - vWorldPos);',
+      '  float d1 = max(dot(N, L1), 0.0);',
+      '',
+      '  // soft fill from the front/camera side so the face reads',
+      '  vec3 L2 = normalize(uFrontLightPos - vWorldPos);',
+      '  float d2 = max(dot(N, L2), 0.0);',
+      '',
+      '  float lum = uAmbient + d1 * uMainLightIntensity + d2 * uFrontLightIntensity;',
+      '',
+      '  // fresnel rim — a brighter outline where the surface grazes the view,',
+      '  // separating the volume from the black background',
+      '  float fres = pow(1.0 - abs(dot(N, V)), 2.5);',
+      '  lum += fres * uHeadRim;',
+      '',
+      '  lum = clamp(lum, 0.0, 0.92);            // cap so the brightest area is \'.\' not blank', 
+      '  lum *= 1.0 - vSocket * 0.97;            // carve the sockets dark — solid @ blocks',
+      '  lum = max(lum, 0.028);                  // keep the socket floor above the bg threshold',
+      '',
+      '  // eyelid highlight ring around each socket (applied after darkening)',
+      '  lum += vSocketRim * uSocketRim;',
+      '  lum = min(lum, 0.92);',
+      '',
+      '  gl_FragColor = vec4(vec3(lum), 1.0);', 
+      '}'
+    ].join('\n');
+
+    var headMat = new THREE.ShaderMaterial({
+      vertexShader: headVert,
+      fragmentShader: headFrag,
+      uniforms: {
+        uTime:               { value: 0 },
+        uMouse:              { value: new THREE.Vector2(0, 0) },
+        uMainLightPos:       { value: new THREE.Vector3(0.0, -2.5, 0.8) },
+        uMainLightIntensity: { value: 1.8 }, 
+        uFrontLightPos:      { value: new THREE.Vector3(0.0, 0.3, 2.6) },
+        uFrontLightIntensity:{ value: 0.68 },
+        uAmbient:            { value: 0.045 },
+        uHeadRim:            { value: 0.42 },
+        uSocketRim:          { value: 0.3 }
+      }
+    });
+
+    var head = new THREE.Mesh(new THREE.SphereGeometry(1, 200, 200), headMat);
+    scene.add(head);
+
+    /* ------------------------------------------------------------------
+     * 4. Post-process — full-screen ASCII pass.
+     *    For each character cell: average luminance (4 taps) -> glyph index
+     *    (dark => dense char), then sample the font atlas for the glyph mask.
+     * ------------------------------------------------------------------ */
+    var CHAR_SIZE = new THREE.Vector2(8 * DPR, 16 * DPR);   // cell size in device px
+
+    var rt = new THREE.WebGLRenderTarget(1, 1);
+    rt.texture.minFilter = THREE.LinearFilter;
+    rt.texture.magFilter = THREE.LinearFilter;
+
+    var postVert = [
+      'varying vec2 vUv;',
+      'void main() {',
+      '  vUv = uv;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+      '}'
+    ].join('\n');
+
+    var postFrag = [
+      'varying vec2 vUv;',
+      '',
+      'uniform sampler2D tScene;',
+      'uniform sampler2D tChars;',
+      'uniform vec2  uCharSize;     // cell size in device px',
+      'uniform vec2  uRes;          // drawing buffer size in device px',
+      'uniform vec2  uAtlasCell;    // atlas cell size in px',
+      'uniform vec2  uAtlasSize;    // atlas size in px',
+      'uniform float uCharCount;',
+      '',
+      'float lum(vec2 uv) {',
+      '  return dot(texture2D(tScene, uv).rgb, vec3(0.299, 0.587, 0.114));',
+      '}',
+      '',
+      'void main() {',
+      '  vec2 cell   = floor(gl_FragCoord.xy / uCharSize);',
+      '  vec2 center = (cell + 0.5) * uCharSize / uRes;',
+      '',
+      '  // 4-tap average over the cell for a cleaner density read',
+      '  vec2 h = uCharSize / uRes * 0.5;',
+      '  float l = lum(center + vec2(-h.x, -h.y));',
+      '  l += lum(center + vec2( h.x, -h.y));',
+      '  l += lum(center + vec2(-h.x,  h.y));',
+      '  l += lum(center + vec2( h.x,  h.y));',
+      '  l *= 0.25;',
+      '',
+      '  // dark -> dense (inverted mapping); near-black = background = space',
+      '  float idx = 0.0;',
+      '  if (l > 0.015) {',
+      '    idx = floor((1.0 - clamp(l, 0.0, 1.0)) * (uCharCount - 1.0) + 0.5);',
+      '  }',
+      '',
+      '  // position within the current cell -> sample the glyph from the atlas',
+      '  vec2 f = fract(gl_FragCoord.xy / uCharSize);',
+      '  vec2 atUv = (vec2(idx * uAtlasCell.x, 0.0) + f * uAtlasCell) / uAtlasSize;',
+      '  float g = texture2D(tChars, atUv).r;',
+      '',
+      '  gl_FragColor = vec4(vec3(g), 1.0);   // pure white glyphs on black',
+      '}'
+    ].join('\n');
+
+    var atlasTex = buildAtlas();
+
+    var postMat = new THREE.ShaderMaterial({
+      vertexShader: postVert,
+      fragmentShader: postFrag,
+      uniforms: {
+        tScene:     { value: rt.texture },
+        tChars:     { value: atlasTex },
+        uCharSize:  { value: CHAR_SIZE.clone() },
+        uRes:       { value: new THREE.Vector2(1, 1) },
+        uAtlasCell: { value: new THREE.Vector2(ATLAS_CELL_W, ATLAS_CELL_H) },
+        uAtlasSize: { value: new THREE.Vector2(atlasTex.image.width, atlasTex.image.height) },
+        uCharCount: { value: CHAR_SET.length }
+      },
+      depthTest: false,
+      depthWrite: false
+    });
+
+    var postScene = new THREE.Scene();
+    postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), postMat));
+    var postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+    postCamera.position.z = 1;
+
+    /* ------------------------------------------------------------------
+     * 5. Mouse tracking + resize
+     * ------------------------------------------------------------------ */
+    var mouseTarget = new THREE.Vector2();
+    var mouseCur = new THREE.Vector2();
+
+    window.addEventListener('pointermove', function (e) {
+      mouseTarget.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouseTarget.y = (e.clientY / window.innerHeight) * 2 - 1;
+    }, { passive: true });
+
+    function onResize() {
+      var w = Math.max(1, window.innerWidth);
+      var h = Math.max(1, window.innerHeight);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      // r152 has no renderer.drawingBufferWidth getter — use getDrawingBufferSize
+      var buf = renderer.getDrawingBufferSize(new THREE.Vector2());
+      var dw = Math.max(1, Math.floor(buf.x));
+      var dh = Math.max(1, Math.floor(buf.y));
+      rt.setSize(dw, dh);
+      postMat.uniforms.uRes.value.set(dw, dh);
+    }
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    /* ------------------------------------------------------------------
+     * 6. Animation loop (all motion is time-driven -> Remotion friendly)
+     * ------------------------------------------------------------------ */
+    var sceneTime = 0;
+
+    // Optional deterministic clock for recording (Remotion, puppeteer, etc.)
+    window.setSceneTime = function (t) { sceneTime = t; };
+
+    var clock = new THREE.Clock();
+    var frame = 0;
+    var checked = false;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frame++;
+
+      sceneTime += clock.getDelta();
+
+      // smooth mouse follow
+      mouseCur.lerp(mouseTarget, 0.07);
+
+      // head: idle sway + gaze toward the cursor
+      var sway = Math.sin(sceneTime * 0.25) * 0.22;
+      var targetYaw = sway + mouseCur.x * 0.22;
+      var targetPitch = mouseCur.y * 0.15;
+      head.rotation.y += (targetYaw - head.rotation.y) * 0.06;
+      head.rotation.x += (targetPitch - head.rotation.x) * 0.06;
+
+      // camera: gentle orbit so the pattern shifts organically
+      camera.position.set(
+        Math.sin(sceneTime * 0.11) * 0.55,
+        Math.cos(sceneTime * 0.13) * 0.32,
+        3.4
+      );
+      camera.lookAt(0, 0, 0);
+
+      headMat.uniforms.uTime.value = sceneTime;
+      headMat.uniforms.uMouse.value.copy(mouseCur);
+
+      // scene -> render target, then ASCII pass -> screen
+      renderer.setRenderTarget(rt);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      renderer.render(postScene, postCamera);
+
+      // One-time canary: confirm the pipeline drew something. This must run in
+      // the same frame as the render — three.js uses preserveDrawingBuffer:false,
+      // so readPixels after the frame returns undefined data. Whole 8x16
+      // character cells are read so single-pixel glyph strokes can't slip
+      // between the sample points.
+      if (!checked && frame >= 2) {
+        checked = true;
+        try {
+          var gl = renderer.getContext();
+          var w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+          var block = new Uint8Array(4 * 8 * 16);
+          var x0 = Math.floor(w / 2 / 8) * 8;    // cell-aligned center
+          var y0 = Math.floor(h / 2 / 16) * 16;
+          var found = false;
+          for (var i = -8; i <= 8 && !found; i++) {
+            for (var j = -8; j <= 8 && !found; j++) {
+              gl.readPixels(x0 + i * 8, y0 + j * 16, 8, 16, gl.RGBA, gl.UNSIGNED_BYTE, block);
+              for (var k = 0; k < block.length && !found; k += 4) {
+                if (block[k] > 10 || block[k + 1] > 10 || block[k + 2] > 10) found = true;
+              }
+            }
+          }
+          if (!found) {
+            showError('The scene rendered black. Open the browser console (F12) and look for WebGL/three.js errors.');
+          }
+        } catch (e) { /* ignore probe failures */ }
+      }
+    }
+
+    animate();
+
+
+  } catch (err) {
+    showError(
+      'Failed to start: ' + (err && err.message ? err.message : err) +
+      '\n\nCheck the browser console (F12) for details.'
+    );
+  }
+})();
+</script>
+</body>
+</html>
